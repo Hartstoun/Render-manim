@@ -29,7 +29,10 @@ jobs:
       - name: Рендер
         working-directory: /tmp/work
         run: manim -ql --format=mp4 scene.py Lesson
-
+        
+      - name: Поставить curl
+        run: apt-get update && apt-get install -y --no-install-recommends curl        
+        
       - name: Отправить в n8n
         run: |
           FILE=$(find /tmp/work/media -name '*.mp4' | head -n 1)
