@@ -5,38 +5,58 @@ on:
     inputs:
       job_id:
         required: true
+        type: string
+      title:
+        required: true
+        type: string
       scene_code:
         required: true
+        type: string
 
 jobs:
   render:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     container:
       image: manimcommunity/manim:latest
       options: --user root
 
     steps:
+      - name: Поставить curl
+        run: apt-get update && apt-get install -y --no-install-recommends curl
+
       - name: Записать сцену
         env:
           SCENE_CODE: ${{ inputs.scene_code }}
         run: |
           mkdir -p /tmp/work
           printf '%s' "$SCENE_CODE" > /tmp/work/scene.py
-          echo "--- полученный код ---"
-          cat /tmp/work/scene.py
 
       - name: Рендер
         working-directory: /tmp/work
-        run: manim -ql --format=mp4 scene.py Lesson
-        
-      - name: Поставить curl
-        run: apt-get update && apt-get install -y --no-install-recommends curl        
-        
-      - name: Отправить в n8n
+        env:
+          TITLE: ${{ inputs.title }}
+        run: manim -ql --format=mp4 -a -o "$TITLE" scene.py
+
+      - name: Найти готовое видео
+        working-directory: /tmp/work
         run: |
-          FILE=$(find /tmp/work/media -name '*.mp4' | head -n 1)
+          FILE=$(find media/videos -name '*.mp4' -not -path '*partial_movie_files*' | head -n 1)
+          if [ -z "$FILE" ]; then
+            echo "Готовое видео не найдено. Что есть:"
+            find media -name '*.mp4'
+            exit 1
+          fi
           echo "Файл: $FILE ($(du -h "$FILE" | cut -f1))"
+          echo "VIDEO=$FILE" >> $GITHUB_ENV
+
+      - name: Отправить в n8n
+        working-directory: /tmp/work
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          TITLE: ${{ inputs.title }}
+        run: |
           curl -sS --fail-with-body -X POST "${{ secrets.N8N_WEBHOOK_URL }}" \
-            -F "job_id=${{ inputs.job_id }}" \
-            -F "video=@${FILE};type=video/mp4"
+            -F "job_id=$JOB_ID" \
+            -F "title=$TITLE" \
+            -F "video=@${VIDEO};type=video/mp4;filename=${TITLE}.mp4"
