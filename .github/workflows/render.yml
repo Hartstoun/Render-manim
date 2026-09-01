@@ -21,7 +21,10 @@ jobs:
 
     steps:
       - name: Зависимости
-        run: apt-get update && apt-get install -y --no-install-recommends curl file
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl file ffmpeg
+          which curl file ffmpeg ffprobe || true
 
       - name: Записать сцену
         env:
@@ -41,33 +44,44 @@ jobs:
           AUDIO_NAME: ${{ inputs.audio_name }}
         run: |
           curl -sS --fail-with-body -L -o "$AUDIO_NAME" "$AUDIO_URL"
+          echo "Размер: $(stat -c%s "$AUDIO_NAME") байт"
           file "$AUDIO_NAME"
-          SIZE=$(stat -c%s "$AUDIO_NAME")
-          echo "Скачано: $AUDIO_NAME, $SIZE байт"
-          if [ "$SIZE" -lt 10000 ]; then
-            echo "Слишком мало — вероятно, вместо аудио пришла HTML-страница:"
-            head -c 300 "$AUDIO_NAME"
+
+          if file "$AUDIO_NAME" | grep -qi 'html\|text'; then
+            echo "::error::Вместо аудио пришла веб-страница. Первые 500 байт:"
+            head -c 500 "$AUDIO_NAME"
             exit 1
           fi
+
+          ffprobe -v error -show_entries format=duration -of csv=p=0 "$AUDIO_NAME" \
+            && echo "Аудио читается" \
+            || { echo "::error::ffprobe не смог разобрать файл"; exit 1; }
+
+      - name: Проверить, что файл на месте
+        working-directory: /tmp/work
+        run: |
+          echo "--- содержимое рабочей папки ---"
+          ls -la
 
       - name: Рендер
         working-directory: /tmp/work
         env:
           TITLE: ${{ inputs.title }}
-        run: |
-          ls -la
-          manim -ql --format=mp4 -a -o "$TITLE" scene.py
+        run: manim -ql --format=mp4 -a -o "$TITLE" scene.py
 
       - name: Найти видео
         working-directory: /tmp/work
         run: |
           FILE=$(find media/videos -name '*.mp4' -not -path '*partial_movie_files*' | head -n 1)
           if [ -z "$FILE" ]; then
-            echo "Готовое видео не найдено:"; find media -name '*.mp4'; exit 1
+            echo "::error::Готовое видео не найдено. Что есть в media:"
+            find media -name '*.mp4'
+            exit 1
           fi
           echo "VIDEO=$FILE" >> $GITHUB_ENV
           echo "Видео: $FILE ($(du -h "$FILE" | cut -f1))"
-          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$FILE"
+          echo "--- дорожки в файле ---"
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$FILE" || true
 
       - name: Колбэк — успех
         working-directory: /tmp/work
@@ -89,12 +103,14 @@ jobs:
         if: failure()
         env:
           JOB_ID: ${{ inputs.job_id }}
+          TITLE:  ${{ inputs.title }}
           NPAGE:  ${{ inputs.notion_page_id }}
           NPROP:  ${{ inputs.notion_prop }}
         run: |
           curl -sS -X POST "${{ secrets.N8N_WEBHOOK_URL }}" \
             -F "status=failed" \
             -F "job_id=$JOB_ID" \
+            -F "title=$TITLE" \
             -F "notion_page_id=$NPAGE" \
             -F "notion_prop=$NPROP" \
             -F "log_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
