@@ -3,15 +3,13 @@ name: Render Manim
 on:
   workflow_dispatch:
     inputs:
-      job_id:
-        required: true
-        type: string
-      title:
-        required: true
-        type: string
-      scene_code:
-        required: true
-        type: string
+      job_id:         { required: true,  type: string }
+      title:          { required: true,  type: string }
+      scene_code:     { required: true,  type: string }
+      audio_url:      { required: false, type: string }
+      audio_name:     { required: false, type: string }
+      notion_page_id: { required: false, type: string }
+      notion_prop:    { required: false, type: string }
 
 jobs:
   render:
@@ -22,8 +20,8 @@ jobs:
       options: --user root
 
     steps:
-      - name: Поставить curl
-        run: apt-get update && apt-get install -y --no-install-recommends curl
+      - name: Зависимости
+        run: apt-get update && apt-get install -y --no-install-recommends curl file
 
       - name: Записать сцену
         env:
@@ -31,32 +29,72 @@ jobs:
         run: |
           mkdir -p /tmp/work
           printf '%s' "$SCENE_CODE" > /tmp/work/scene.py
+          cd /tmp/work
+          echo "--- сцена ждёт такие аудиофайлы ---"
+          grep -o 'add_sound([^)]*)' scene.py || echo "add_sound в коде нет"
+
+      - name: Скачать озвучку
+        if: inputs.audio_url != ''
+        working-directory: /tmp/work
+        env:
+          AUDIO_URL:  ${{ inputs.audio_url }}
+          AUDIO_NAME: ${{ inputs.audio_name }}
+        run: |
+          curl -sS --fail-with-body -L -o "$AUDIO_NAME" "$AUDIO_URL"
+          file "$AUDIO_NAME"
+          SIZE=$(stat -c%s "$AUDIO_NAME")
+          echo "Скачано: $AUDIO_NAME, $SIZE байт"
+          if [ "$SIZE" -lt 10000 ]; then
+            echo "Слишком мало — вероятно, вместо аудио пришла HTML-страница:"
+            head -c 300 "$AUDIO_NAME"
+            exit 1
+          fi
 
       - name: Рендер
         working-directory: /tmp/work
         env:
           TITLE: ${{ inputs.title }}
-        run: manim -ql --format=mp4 -a -o "$TITLE" scene.py
+        run: |
+          ls -la
+          manim -ql --format=mp4 -a -o "$TITLE" scene.py
 
-      - name: Найти готовое видео
+      - name: Найти видео
         working-directory: /tmp/work
         run: |
           FILE=$(find media/videos -name '*.mp4' -not -path '*partial_movie_files*' | head -n 1)
           if [ -z "$FILE" ]; then
-            echo "Готовое видео не найдено. Что есть:"
-            find media -name '*.mp4'
-            exit 1
+            echo "Готовое видео не найдено:"; find media -name '*.mp4'; exit 1
           fi
-          echo "Файл: $FILE ($(du -h "$FILE" | cut -f1))"
           echo "VIDEO=$FILE" >> $GITHUB_ENV
+          echo "Видео: $FILE ($(du -h "$FILE" | cut -f1))"
+          ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$FILE"
 
-      - name: Отправить в n8n
+      - name: Колбэк — успех
         working-directory: /tmp/work
         env:
           JOB_ID: ${{ inputs.job_id }}
-          TITLE: ${{ inputs.title }}
+          TITLE:  ${{ inputs.title }}
+          NPAGE:  ${{ inputs.notion_page_id }}
+          NPROP:  ${{ inputs.notion_prop }}
         run: |
           curl -sS --fail-with-body -X POST "${{ secrets.N8N_WEBHOOK_URL }}" \
+            -F "status=ok" \
             -F "job_id=$JOB_ID" \
             -F "title=$TITLE" \
-            -F "video=@${VIDEO};type=video/mp4;filename=${TITLE}.mp4"
+            -F "notion_page_id=$NPAGE" \
+            -F "notion_prop=$NPROP" \
+            -F "video=@${VIDEO};type=video/mp4"
+
+      - name: Колбэк — провал
+        if: failure()
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          NPAGE:  ${{ inputs.notion_page_id }}
+          NPROP:  ${{ inputs.notion_prop }}
+        run: |
+          curl -sS -X POST "${{ secrets.N8N_WEBHOOK_URL }}" \
+            -F "status=failed" \
+            -F "job_id=$JOB_ID" \
+            -F "notion_page_id=$NPAGE" \
+            -F "notion_prop=$NPROP" \
+            -F "log_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
