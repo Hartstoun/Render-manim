@@ -67,7 +67,7 @@ jobs:
         working-directory: /tmp/work
         env:
           TITLE: ${{ inputs.title }}
-        run: manim -ql --format=mp4 -a -o "$TITLE" scene.py
+        run: manim -ql --format=mp4 -a scene.py
 
       - name: Найти видео
         working-directory: /tmp/work
