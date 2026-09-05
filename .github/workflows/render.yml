@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     container:
-      image: manimcommunity/manim:latest
+      image: manimcommunity/manim:v0.21.0
       options: --user root
 
     steps:
