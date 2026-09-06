@@ -10,6 +10,7 @@ on:
       audio_name:     { required: false, type: string }
       notion_page_id: { required: false, type: string }
       notion_prop:    { required: false, type: string }
+      attempt:        { required: false, type: string, default: '1' }
 
 jobs:
   render:
@@ -43,19 +44,31 @@ jobs:
           AUDIO_URL:  ${{ inputs.audio_url }}
           AUDIO_NAME: ${{ inputs.audio_name }}
         run: |
-          curl -sS --fail-with-body -L -o "$AUDIO_NAME" "$AUDIO_URL"
+          set +e
+          curl -sS --fail-with-body -L -o "$AUDIO_NAME" "$AUDIO_URL" 2>&1 | tee dl.log
+          CODE=${PIPESTATUS[0]}
+          set -e
+          if [ "$CODE" -ne 0 ]; then
+            echo "::error::Не удалось скачать аудио"
+            { echo "СКАЧИВАНИЕ АУДИО НЕ УДАЛОСЬ"; tail -c 1000 dl.log; } > error.txt
+            exit 1
+          fi
+
           echo "Размер: $(stat -c%s "$AUDIO_NAME") байт"
           file "$AUDIO_NAME"
 
           if file "$AUDIO_NAME" | grep -qi 'html\|text'; then
-            echo "::error::Вместо аудио пришла веб-страница. Первые 500 байт:"
-            head -c 500 "$AUDIO_NAME"
+            echo "::error::Вместо аудио пришла веб-страница"
+            { echo "DRIVE ВЕРНУЛ HTML ВМЕСТО АУДИО:"; head -c 800 "$AUDIO_NAME"; } > error.txt
             exit 1
           fi
 
-          ffprobe -v error -show_entries format=duration -of csv=p=0 "$AUDIO_NAME" \
-            && echo "Аудио читается" \
-            || { echo "::error::ffprobe не смог разобрать файл"; exit 1; }
+          if ! ffprobe -v error -show_entries format=duration -of csv=p=0 "$AUDIO_NAME"; then
+            echo "::error::ffprobe не смог разобрать файл"
+            echo "АУДИОФАЙЛ НЕ ЧИТАЕТСЯ ffprobe" > error.txt
+            exit 1
+          fi
+          echo "Аудио читается"
 
       - name: Проверить, что файл на месте
         working-directory: /tmp/work
@@ -65,17 +78,24 @@ jobs:
 
       - name: Рендер
         working-directory: /tmp/work
-        env:
-          TITLE: ${{ inputs.title }}
-        run: manim -ql --format=mp4 -a scene.py
+        run: |
+          set +e
+          manim -ql --format=mp4 -a scene.py 2>&1 | tee render.log
+          CODE=${PIPESTATUS[0]}
+          set -e
+          if [ "$CODE" -ne 0 ]; then
+            echo "::error::Рендер упал с кодом $CODE"
+            tail -c 1800 render.log > error.txt
+            exit "$CODE"
+          fi
 
       - name: Найти видео
         working-directory: /tmp/work
         run: |
           FILE=$(find media/videos -name '*.mp4' -not -path '*partial_movie_files*' | head -n 1)
           if [ -z "$FILE" ]; then
-            echo "::error::Готовое видео не найдено. Что есть в media:"
-            find media -name '*.mp4'
+            echo "::error::Готовое видео не найдено"
+            { echo "РЕНДЕР ПРОШЁЛ, НО MP4 НЕ НАЙДЕН. Что есть в media:"; find media -name '*.mp4'; } > error.txt
             exit 1
           fi
           echo "VIDEO=$FILE" >> $GITHUB_ENV
@@ -86,10 +106,11 @@ jobs:
       - name: Колбэк — успех
         working-directory: /tmp/work
         env:
-          JOB_ID: ${{ inputs.job_id }}
-          TITLE:  ${{ inputs.title }}
-          NPAGE:  ${{ inputs.notion_page_id }}
-          NPROP:  ${{ inputs.notion_prop }}
+          JOB_ID:  ${{ inputs.job_id }}
+          TITLE:   ${{ inputs.title }}
+          NPAGE:   ${{ inputs.notion_page_id }}
+          NPROP:   ${{ inputs.notion_prop }}
+          ATTEMPT: ${{ inputs.attempt }}
         run: |
           curl -sS --fail-with-body -X POST "${{ secrets.N8N_WEBHOOK_URL }}" \
             -F "status=ok" \
@@ -97,20 +118,28 @@ jobs:
             -F "title=$TITLE" \
             -F "notion_page_id=$NPAGE" \
             -F "notion_prop=$NPROP" \
+            -F "attempt=$ATTEMPT" \
             -F "video=@${VIDEO};type=video/mp4"
 
       - name: Колбэк — провал
         if: failure()
+        working-directory: /tmp/work
         env:
-          JOB_ID: ${{ inputs.job_id }}
-          TITLE:  ${{ inputs.title }}
-          NPAGE:  ${{ inputs.notion_page_id }}
-          NPROP:  ${{ inputs.notion_prop }}
+          JOB_ID:  ${{ inputs.job_id }}
+          TITLE:   ${{ inputs.title }}
+          NPAGE:   ${{ inputs.notion_page_id }}
+          NPROP:   ${{ inputs.notion_prop }}
+          ATTEMPT: ${{ inputs.attempt }}
         run: |
+          [ -f error.txt ] || echo "Падение на раннем шаге — смотри лог запуска" > error.txt
+          echo "--- отправляем такой traceback ---"
+          cat error.txt
           curl -sS -X POST "${{ secrets.N8N_WEBHOOK_URL }}" \
             -F "status=failed" \
             -F "job_id=$JOB_ID" \
             -F "title=$TITLE" \
             -F "notion_page_id=$NPAGE" \
             -F "notion_prop=$NPROP" \
-            -F "log_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            -F "attempt=$ATTEMPT" \
+            -F "log_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -F "traceback=<error.txt"
