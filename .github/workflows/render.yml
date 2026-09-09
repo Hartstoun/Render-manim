@@ -45,14 +45,13 @@ jobs:
           AUDIO_NAME: ${{ inputs.audio_name }}
         run: |
           set +e
-          manim -ql --format=mp4 -a scene.py > render.log 2>&1
-          CODE=$?
+          curl -sS --fail-with-body -L -o "$AUDIO_NAME" "$AUDIO_URL" 2>&1 | tee dl.log
+          CODE=${PIPESTATUS[0]}
           set -e
-          cat render.log
           if [ "$CODE" -ne 0 ]; then
-            echo "::error::Рендер упал с кодом $CODE"
-            tail -c 1800 render.log > error.txt
-            exit "$CODE"
+            echo "::error::Не удалось скачать аудио"
+            { echo "СКАЧИВАНИЕ АУДИО НЕ УДАЛОСЬ"; tail -c 1000 dl.log; } > error.txt
+            exit 1
           fi
 
           echo "Размер: $(stat -c%s "$AUDIO_NAME") байт"
