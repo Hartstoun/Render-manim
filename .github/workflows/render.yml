@@ -169,7 +169,7 @@ jobs:
           echo "Доступ: $(head -c 200 perm.json)"
 
           echo "FILE_ID=$FILE_ID" >> $GITHUB_ENV
-          echo "VIDEO_URL=https://drive.google.com/file/d/$FILE_ID/view" >> $GITHUB_ENV
+          echo "VIDEO_URL=https://drive.google.com/uc?export=download&id=$FILE_ID" >> $GITHUB_ENV
           echo "Загружено: https://drive.google.com/file/d/$FILE_ID/view"
 
       - name: Колбэк — успех
