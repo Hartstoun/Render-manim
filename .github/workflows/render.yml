@@ -128,12 +128,8 @@ jobs:
 
           # 2. Открываем resumable-сессию
           python3 -c "
-          import json, os
-          meta = {'name': os.environ['TITLE'] + '.mp4'}
-          folder = os.environ.get('FOLDER_ID', '').strip()
-          if folder:
-              meta['parents'] = [folder]
-          print(json.dumps(meta))
+          import json,os
+          print(json.dumps({'name': os.environ['TITLE'] + '.mp4', 'parents': [os.environ['FOLDER_ID']]}))
           " > meta.json
 
           curl -sS -X POST \
