@@ -25,7 +25,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends curl file ffmpeg
-          which curl file ffmpeg ffprobe || true
+          which curl file ffmpeg ffprobe python3 || true
 
       - name: Записать сцену
         env:
@@ -71,12 +71,6 @@ jobs:
           fi
           echo "Аудио читается"
 
-      - name: Проверить, что файл на месте
-        working-directory: /tmp/work
-        run: |
-          echo "--- содержимое рабочей папки ---"
-          ls -la
-
       - name: Рендер
         working-directory: /tmp/work
         run: |
@@ -102,11 +96,84 @@ jobs:
           fi
           echo "VIDEO=$FILE" >> $GITHUB_ENV
           echo "Видео: $FILE ($(du -h "$FILE" | cut -f1))"
-          echo "--- дорожки в файле ---"
           ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$FILE" || true
 
-      - name: Колбэк — успех
+      - name: Загрузить на Drive
+        id: upload
         working-directory: /tmp/work
+        env:
+          CLIENT_ID:     ${{ secrets.GDRIVE_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          FOLDER_ID:     ${{ secrets.GDRIVE_FOLDER_ID }}
+          TITLE:         ${{ inputs.title }}
+        run: |
+          set -e
+
+          # 1. Обновляем access token
+          curl -sS -X POST https://oauth2.googleapis.com/token \
+            -d "client_id=$CLIENT_ID" \
+            -d "client_secret=$CLIENT_SECRET" \
+            -d "refresh_token=$REFRESH_TOKEN" \
+            -d "grant_type=refresh_token" > token.json
+
+          TOKEN=$(python3 -c "import json;print(json.load(open('token.json')).get('access_token',''))")
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Не удалось получить access token"
+            { echo "OAUTH НЕ СРАБОТАЛ:"; python3 -c "import json;d=json.load(open('token.json'));print(d.get('error'),d.get('error_description'))"; } > error.txt
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          echo "Токен получен"
+
+          # 2. Открываем resumable-сессию
+          python3 -c "
+          import json,os
+          print(json.dumps({'name': os.environ['TITLE'] + '.mp4', 'parents': [os.environ['FOLDER_ID']]}))
+          " > meta.json
+
+          curl -sS -X POST \
+            "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json; charset=UTF-8" \
+            --data-binary @meta.json \
+            -D init_headers.txt -o init_body.txt
+
+          LOCATION=$(grep -i '^location:' init_headers.txt | sed 's/^[Ll]ocation: *//' | tr -d '\r\n')
+          if [ -z "$LOCATION" ]; then
+            echo "::error::Drive не открыл сессию загрузки"
+            { echo "DRIVE ОТКАЗАЛ:"; head -c 800 init_body.txt; } > error.txt
+            exit 1
+          fi
+
+          # 3. Заливаем файл
+          curl -sS -X PUT "$LOCATION" \
+            -H "Content-Type: video/mp4" \
+            --upload-file "$VIDEO" \
+            --retry 3 --retry-delay 10 --retry-all-errors \
+            --max-time 900 > upload.json
+
+          FILE_ID=$(python3 -c "import json;print(json.load(open('upload.json')).get('id',''))")
+          if [ -z "$FILE_ID" ]; then
+            echo "::error::Загрузка не вернула id файла"
+            { echo "ЗАГРУЗКА НА DRIVE НЕ УДАЛАСЬ:"; head -c 800 upload.json; } > error.txt
+            exit 1
+          fi
+
+          # 4. Открываем доступ по ссылке
+          curl -sS -X POST \
+            "https://www.googleapis.com/drive/v3/files/$FILE_ID/permissions" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"role":"reader","type":"anyone"}' > perm.json
+          echo "Доступ: $(head -c 200 perm.json)"
+
+          echo "FILE_ID=$FILE_ID" >> $GITHUB_ENV
+          echo "VIDEO_URL=https://drive.google.com/file/d/$FILE_ID/view" >> $GITHUB_ENV
+          echo "Загружено: https://drive.google.com/file/d/$FILE_ID/view"
+
+      - name: Колбэк — успех
+        id: cb_ok
         env:
           JOB_ID:  ${{ inputs.job_id }}
           TITLE:   ${{ inputs.title }}
@@ -115,16 +182,18 @@ jobs:
           ATTEMPT: ${{ inputs.attempt }}
         run: |
           curl -sS --fail-with-body -X POST "${{ secrets.N8N_WEBHOOK_URL }}" \
+            --retry 3 --retry-delay 10 --retry-all-errors \
             -F "status=ok" \
             -F "job_id=$JOB_ID" \
             -F "title=$TITLE" \
             -F "notion_page_id=$NPAGE" \
             -F "notion_prop=$NPROP" \
             -F "attempt=$ATTEMPT" \
-            -F "video=@${VIDEO};type=video/mp4"
+            -F "video_url=$VIDEO_URL" \
+            -F "file_id=$FILE_ID"
 
       - name: Колбэк — провал
-        if: failure()
+        if: failure() && steps.cb_ok.outcome != 'failure'
         working-directory: /tmp/work
         env:
           JOB_ID:  ${{ inputs.job_id }}
