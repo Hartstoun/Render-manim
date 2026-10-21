@@ -98,6 +98,69 @@ jobs:
           echo "Видео: $FILE ($(du -h "$FILE" | cut -f1))"
           ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$FILE" || true
 
+      # ── Выравнивание громкости: любое видео приводится к одному стандарту ──
+      # Двухпроходный loudnorm (EBU R128) по готовому mp4; видеопоток копируется без перекодирования.
+      # Если что-то пойдёт не так — видео остаётся с исходным звуком, рендер не падает.
+      - name: Выровнять громкость
+        working-directory: /tmp/work
+        env:
+          TARGET_I:   "-14"     # целевая громкость, LUFS (стандарт Shorts / Reels / TikTok)
+          TARGET_TP:  "-1.5"    # потолок пиков, dBTP
+          TARGET_LRA: "11"      # допустимый разброс громкости, LU
+          # предобработка голоса: срез гула + мягкий компрессор. Пустая строка — отключить
+          VOICE_CHAIN: "highpass=f=70,acompressor=threshold=-22dB:ratio=2.5:attack=15:release=200:makeup=1"
+        run: |
+          set +e
+
+          if ! ffprobe -v error -select_streams a -show_entries stream=codec_type -of csv=p=0 "$VIDEO" | grep -q audio; then
+            echo "::warning::В видео нет аудиодорожки — нормализацию пропускаем"
+            exit 0
+          fi
+
+          PRE=""
+          [ -n "$VOICE_CHAIN" ] && PRE="$VOICE_CHAIN,"
+          LN="loudnorm=I=$TARGET_I:TP=$TARGET_TP:LRA=$TARGET_LRA"
+
+          # Проход 1: замер
+          ffmpeg -hide_banner -nostats -i "$VIDEO" -vn \
+            -af "${PRE}${LN}:print_format=json" -f null - 2> measure.log
+
+          PARAMS=$(python3 -c "
+          import json, re, math
+          t = open('measure.log', encoding='utf-8', errors='ignore').read()
+          blocks = re.findall(r'\{[^{}]*\"input_i\"[^{}]*\}', t, re.S)
+          if not blocks: raise SystemExit(1)
+          d = json.loads(blocks[-1])
+          if math.isinf(float(d['input_i'])): raise SystemExit(2)
+          print('До: %s LUFS, пик %s dBTP' % (d['input_i'], d['input_tp']), file=open('before.txt', 'w'))
+          print('measured_I=%s:measured_TP=%s:measured_LRA=%s:measured_thresh=%s:offset=%s'
+                % (d['input_i'], d['input_tp'], d['input_lra'], d['input_thresh'], d['target_offset']))
+          ")
+          if [ $? -ne 0 ] || [ -z "$PARAMS" ]; then
+            echo "::warning::Не удалось замерить громкость (тишина или ошибка) — оставляем исходный звук"
+            tail -n 20 measure.log
+            exit 0
+          fi
+          cat before.txt
+
+          # Проход 2: нормализация, видео копируется как есть
+          ffmpeg -hide_banner -nostats -y -i "$VIDEO" \
+            -map 0:v:0 -map 0:a:0 -c:v copy \
+            -af "${PRE}${LN}:${PARAMS}:linear=true,aresample=48000" \
+            -c:a aac -b:a 192k -movflags +faststart normalized.mp4 2> normalize.log
+          if [ $? -ne 0 ] || [ ! -s normalized.mp4 ]; then
+            echo "::warning::Нормализация не удалась — оставляем исходный звук"
+            tail -n 20 normalize.log
+            exit 0
+          fi
+
+          mv -f normalized.mp4 "$VIDEO"
+
+          # Контрольный замер для лога
+          ffmpeg -hide_banner -nostats -i "$VIDEO" -vn -af ebur128=framelog=quiet -f null - 2>&1 \
+            | grep -E 'I:|Peak:|LRA:' | tail -n 4 | sed 's/^/После: /'
+          echo "Громкость выровнена до $TARGET_I LUFS"
+
       - name: Загрузить на Drive
         id: upload
         working-directory: /tmp/work
